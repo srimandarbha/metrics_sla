@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"runtime"
 	"time"
 
@@ -16,6 +18,38 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 )
 
+// Log file path
+const logFilePath = "otel_sla_logs.json"
+
+// Struct for JSON log entry
+type LogEntry struct {
+	Message            string `json:"message"`
+	CollectorTimestamp string `json:"collector_timestamp"`
+}
+
+// Function to write JSON log to a file
+func logToFile(entry LogEntry) {
+	file, err := os.OpenFile(logFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Printf("Failed to open log file: %v", err)
+		return
+	}
+	defer file.Close()
+
+	jsonData, err := json.Marshal(entry)
+	if err != nil {
+		log.Printf("Failed to marshal JSON: %v", err)
+		return
+	}
+
+	// Append newline for each log entry
+	_, err = file.WriteString(string(jsonData) + "\n")
+	if err != nil {
+		log.Printf("Failed to write log entry: %v", err)
+	}
+}
+
+// Creates and configures a new Meter Provider
 func newMeterProvider(ctx context.Context) (metric.MeterProvider, error) {
 	interval := 10 * time.Second
 
@@ -39,24 +73,28 @@ func newMeterProvider(ctx context.Context) (metric.MeterProvider, error) {
 	return provider, nil
 }
 
+// Creates a new Meter
 func NewMeter(ctx context.Context) (metric.Meter, error) {
 	provider, err := newMeterProvider(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("could not create meter provider: %w", err)
 	}
 
-	// Set global Meter Provider
 	otel.SetMeterProvider(provider)
 
 	return provider.Meter("otel_sla"), nil
 }
 
+// Returns a resource with additional attributes
 func getResource() (*resource.Resource, error) {
+	hostname, _ := os.Hostname()
 	res, err := resource.Merge(
 		resource.Default(),
 		resource.NewWithAttributes(
 			semconv.SchemaURL,
 			semconv.ServiceNameKey.String("otel-sla"),
+			attribute.String("host.name", hostname),
+			attribute.String("os.type", runtime.GOOS),
 		),
 	)
 	if err != nil {
@@ -65,6 +103,7 @@ func getResource() (*resource.Resource, error) {
 	return res, nil
 }
 
+// Creates an OTLP metrics exporter
 func getOtelMetricsCollectorExporter(ctx context.Context) (metricsdk.Exporter, error) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
@@ -81,19 +120,19 @@ func getOtelMetricsCollectorExporter(ctx context.Context) (metricsdk.Exporter, e
 	return exporter, nil
 }
 
-// Collects memory usage every 5 seconds
-func collectMachineResourceMetrics(meter metric.Meter) {
+// Collects and reports memory usage periodically
+func collectMachineResourceMetrics(ctx context.Context, meter metric.Meter) {
 	var Mb uint64 = 1_048_576 // Convert bytes to MB
 
-	// Define the observable gauge metric
-
+	// Create observable gauge for memory usage
 	memGauge, err := meter.Float64ObservableGauge(
 		"otel.sla.metric",
-		metric.WithDescription("otel-sla-metric"),
-		metric.WithUnit("count"),
+		metric.WithDescription("Allocated memory in MB"),
+		metric.WithUnit("MB"),
 	)
 	if err != nil {
-		log.Fatalf("Failed to create metric: %v", err)
+		log.Printf("Failed to create memory gauge: %v", err)
+		return
 	}
 
 	// Register callback to observe memory stats
@@ -101,37 +140,70 @@ func collectMachineResourceMetrics(meter metric.Meter) {
 		var memStats runtime.MemStats
 		runtime.ReadMemStats(&memStats)
 		allocatedMemoryInMB := float64(memStats.Alloc) / float64(Mb)
-		timestamp := time.Now().Format(time.RFC3339)
-		o.ObserveFloat64(memGauge, allocatedMemoryInMB, metric.WithAttributes(attribute.String("metric_generation_time", timestamp)))
+		o.ObserveFloat64(memGauge, allocatedMemoryInMB, metric.WithAttributes(
+			attribute.String("metric_generation_time", time.Now().Format(time.RFC3339)),
+		))
 		return nil
 	}, memGauge)
 
 	if err != nil {
-		log.Fatalf("Failed to register callback: %v", err)
+		log.Printf("Failed to register memory callback: %v", err)
 	}
 }
 
-func main() {
-	ctx := context.Background()
-	meter, err := NewMeter(ctx)
+// Increments the memory counter periodically and logs JSON to a file
+func startMemoryCounter(ctx context.Context, meter metric.Meter) {
+	counter, err := meter.Int64Counter(
+		"allocated_memory_in_mb",
+		metric.WithDescription("Total allocated memory in MB"),
+		metric.WithUnit("MB"),
+	)
 	if err != nil {
-		fmt.Printf("Could not create meter: %v\n", err)
+		log.Printf("Failed to create memory counter: %v", err)
 		return
 	}
 
-	// Start collecting memory metrics
-	collectMachineResourceMetrics(meter)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				var memStats runtime.MemStats
+				runtime.ReadMemStats(&memStats)
+				allocatedMemoryInMB := int64(memStats.Alloc / 1_048_576)
 
-	// Create a counter metric
-	counter, err := meter.Int64Counter("allocated_memory_in_mb",
-		metric.WithDescription("The total allocated memory in MB"), // Description of the metric
-		metric.WithUnit("count"))
+				// Increment the counter
+				counter.Add(ctx, allocatedMemoryInMB, metric.WithAttributes(
+					attribute.String("metric_collection_time", time.Now().Format(time.RFC3339)),
+				))
+
+				// Log JSON entry to file
+				logToFile(LogEntry{
+					Message:            "otel-sla-logs",
+					CollectorTimestamp: time.Now().Format(time.RFC3339),
+				})
+
+				time.Sleep(5 * time.Second)
+			}
+		}
+	}()
+}
+
+func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	meter, err := NewMeter(ctx)
 	if err != nil {
-		log.Fatalf("Failed to create counter: %v", err)
+		log.Fatalf("Could not create meter: %v", err)
 	}
 
-	// Increment the counter
-	counter.Add(ctx, 1)
+	// Start collecting memory metrics
+	collectMachineResourceMetrics(ctx, meter)
+
+	// Start counter updates and JSON logging
+	startMemoryCounter(ctx, meter)
 
 	// Keep the application running
 	select {}
